@@ -24,12 +24,13 @@ pub struct Channel {
     pub data: Vec<u8>,
 }
 
-/// Device type constants for track identification.
-pub const DEVICE_MT32: u8 = 0x00;
-pub const DEVICE_MT32_V2: u8 = 0x08;
-pub const DEVICE_ADLIB: u8 = 0x06;
+/// Device type constants for SCI1/SCI1.1 track identification.
+/// These follow ScummVM's getPlayId() mapping for SCI1+.
+pub const DEVICE_ADLIB: u8 = 0x00;
 pub const DEVICE_GM: u8 = 0x07;
-pub const DEVICE_PC_SPEAKER: u8 = 0x0C;
+pub const DEVICE_MT32: u8 = 0x0C;
+pub const DEVICE_PC_SPEAKER: u8 = 0x12;
+pub const DEVICE_PCJR: u8 = 0x13;
 
 /// A timed MIDI event for synthesis.
 #[derive(Debug, Clone)]
@@ -41,7 +42,7 @@ pub struct TimedMidiEvent {
 }
 
 impl SoundResource {
-    /// Find the MT-32 track (type 0x00), falling back to type 0x08.
+    /// Find the MT-32 track (type 0x0C), falling back to GM (0x07).
     pub fn mt32_track(&self) -> Option<&Track> {
         self.tracks
             .iter()
@@ -49,7 +50,7 @@ impl SoundResource {
             .or_else(|| {
                 self.tracks
                     .iter()
-                    .find(|t| t.device_type == DEVICE_MT32_V2)
+                    .find(|t| t.device_type == DEVICE_GM)
             })
     }
 }

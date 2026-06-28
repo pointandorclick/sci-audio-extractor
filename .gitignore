@@ -1,6 +1,7 @@
 .agentshell/
 /target
 roms/*.ROM
+output/*
 
 
 # Added by cargo
