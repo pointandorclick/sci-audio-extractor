@@ -204,12 +204,17 @@ fn process_sound(
     let sound = parser::parse_sound_resource(&data)
         .with_context(|| format!("Failed to parse sound {}", entry.number))?;
 
+    if verbose {
+        let track_types: Vec<String> = sound.tracks.iter().map(|t| format!("{:#04x}", t.device_type)).collect();
+        eprintln!("\n  Sound {}: track types: [{}]", entry.number, track_types.join(", "));
+    }
+
     // Find the MT-32 track
     let mt32_track = match sound.mt32_track() {
         Some(track) => track,
         None => {
             if verbose {
-                eprintln!("\n  Sound {}: no MT-32 track, skipping", entry.number);
+                eprintln!("  Sound {}: no MT-32 track, skipping", entry.number);
             }
             return Ok(false);
         }
@@ -228,24 +233,36 @@ fn process_sound(
 
     if events.is_empty() {
         if verbose {
-            eprintln!("\n  Sound {}: no MIDI events, skipping", entry.number);
+            eprintln!("  Sound {}: no MIDI events, skipping", entry.number);
+        }
+        return Ok(false);
+    }
+
+    let note_on_count = events.iter().filter(|e| e.message.first().map(|b| b & 0xF0 == 0x90).unwrap_or(false)).count();
+
+    if note_on_count == 0 {
+        if verbose {
+            eprintln!("  Sound {}: no note-on events (control-only), skipping", entry.number);
         }
         return Ok(false);
     }
 
     if verbose {
         let duration_secs = events.last().map(|e| e.tick as f64 / 60.0).unwrap_or(0.0);
+        let sysex_count = events.iter().filter(|e| e.message.first() == Some(&0xF0)).count();
         eprintln!(
-            "\n  Sound {}: {} events, {:.1}s, {} channels",
+            "  Sound {}: {} events ({} note-ons, {} sysex), {:.1}s, {} channels",
             entry.number,
             events.len(),
+            note_on_count,
+            sysex_count,
             duration_secs,
             mt32_track.channels.len()
         );
     }
 
     // Render through CM-32L
-    let pcm = synth::render_to_pcm_with_rom_data(control_rom, pcm_rom, &events)
+    let pcm = synth::render_to_pcm_with_rom_data(control_rom, pcm_rom, &events, mt32_track)
         .with_context(|| format!("Failed to render sound {}", entry.number))?;
 
     if pcm.is_empty() {

@@ -15,9 +15,12 @@ pub fn parse_sound_resource(data: &[u8]) -> Result<SoundResource, SciError> {
         }
 
         // Digital track marker (0xF0) - skip it
+        // ScummVM: first byte is _soundPriority, then skip 6 bytes (one channel entry), then 0xFF
         if track_type == 0xF0 {
-            // First byte of channel list is priority, then 6 bytes of channel data, then 0xFF
-            pos += 6;
+            // Skip channel entries until 0xFF terminator
+            while pos < data.len() && data[pos] != 0xFF {
+                pos += 6;
+            }
             if pos < data.len() && data[pos] == 0xFF {
                 pos += 1;
             }
@@ -109,17 +112,21 @@ pub fn extract_midi_events(track: &Track) -> Result<Vec<TimedMidiEvent>, SciErro
 
 /// Parse MIDI events from a single channel's data.
 /// Uses Sierra's modified MIDI format with 0xF8 delay markers.
+/// Follows ScummVM's midiMixChannels/parseNextEvent logic.
 fn parse_channel_midi(data: &[u8], midi_channel: u8) -> Result<Vec<TimedMidiEvent>, SciError> {
     let mut events = Vec::new();
     let mut pos = 0;
     let mut tick: u64 = 0;
     let mut running_status: Option<u8> = None;
 
+    // Channel 15 is SCI's control channel (loop markers, cues, reverb, etc.)
+    // These events should not be sent to the synthesizer.
+    let is_control_channel = midi_channel == 0x0F;
+
     while pos < data.len() {
         // Read delta time
-        // In SCI, delta time bytes precede each event.
-        // 0xF8 = 240-tick delay marker (can appear multiple times).
-        // Other values < 0x80 are small delta values.
+        // In SCI, 0xF8 = 240-tick delay marker (no event follows).
+        // Other values < 0x80 are delta tick values preceding an event.
         loop {
             if pos >= data.len() {
                 return Ok(events);
@@ -150,13 +157,23 @@ fn parse_channel_midi(data: &[u8], midi_channel: u8) -> Result<Vec<TimedMidiEven
         }
 
         // Read status byte or use running status
-        let status = if data[pos] >= 0x80 {
+        // ScummVM: if (midiCommand & 0x80) { read param } else { param = byte; cmd = prev }
+        let (status, first_param) = if data[pos] >= 0x80 {
             let s = data[pos];
             pos += 1;
             running_status = Some(s);
-            s
+            // First data byte follows
+            if pos >= data.len() {
+                break;
+            }
+            let p = data[pos];
+            pos += 1;
+            (s, p)
         } else if let Some(s) = running_status {
-            s
+            // Running status: the byte IS the first data byte
+            let p = data[pos];
+            pos += 1;
+            (s, p)
         } else {
             // No running status and no status byte - skip
             pos += 1;
@@ -165,53 +182,47 @@ fn parse_channel_midi(data: &[u8], midi_channel: u8) -> Result<Vec<TimedMidiEven
 
         // Parse based on status type
         let msg_type = status & 0xF0;
-        let channel_in_status = status & 0x0F;
-
-        // For channel messages, replace the channel with the actual MIDI channel from the header
-        let actual_status = msg_type | midi_channel;
 
         match msg_type {
             0x80 | 0x90 | 0xA0 | 0xB0 | 0xE0 => {
                 // Two data bytes: note off, note on, aftertouch, control change, pitch bend
-                if pos + 1 >= data.len() {
+                if pos >= data.len() {
                     break;
                 }
-                let d1 = data[pos];
-                let d2 = data[pos + 1];
-                pos += 2;
+                let d2 = data[pos];
+                pos += 1;
 
-                // Channel 15 special commands (control channel)
-                if channel_in_status == 0x0F {
-                    if msg_type == 0xB0 && d1 == 0x7F {
-                        // Loop point marker - ignore for single playthrough
-                        continue;
-                    }
-                    // Other channel 15 events: end marker etc.
-                    // 0xFC on channel 15 means end of track
+                // Skip all channel 15 events - they are SCI control messages
+                if is_control_channel {
+                    continue;
                 }
 
+                // Use the MIDI channel from the channel header, not from the status byte
+                let actual_status = msg_type | midi_channel;
                 events.push(TimedMidiEvent {
                     tick,
-                    message: vec![actual_status, d1, d2],
+                    message: vec![actual_status, first_param, d2],
                 });
             }
             0xC0 | 0xD0 => {
                 // One data byte: program change, channel pressure
-                if pos >= data.len() {
-                    break;
-                }
-                let d1 = data[pos];
-                pos += 1;
+                // first_param is the only data byte (already read above)
 
+                // Skip channel 15 control events
+                if is_control_channel {
+                    continue;
+                }
+
+                let actual_status = msg_type | midi_channel;
                 events.push(TimedMidiEvent {
                     tick,
-                    message: vec![actual_status, d1],
+                    message: vec![actual_status, first_param],
                 });
             }
             0xF0 => {
                 if status == 0xF0 {
-                    // SysEx message - read until 0xF7
-                    let mut sysex = vec![0xF0];
+                    // SysEx message - first_param is the first SysEx data byte
+                    let mut sysex = vec![0xF0, first_param];
                     while pos < data.len() && data[pos] != 0xF7 {
                         sysex.push(data[pos]);
                         pos += 1;
@@ -229,12 +240,8 @@ fn parse_channel_midi(data: &[u8], midi_channel: u8) -> Result<Vec<TimedMidiEven
                     // End of track
                     break;
                 } else if status == 0xFF {
-                    // Meta event - read type and length
-                    if pos + 1 >= data.len() {
-                        break;
-                    }
-                    let meta_type = data[pos];
-                    pos += 1;
+                    // Meta event - first_param is the meta type
+                    let meta_type = first_param;
 
                     if meta_type == 0x2F {
                         // End of track
@@ -261,7 +268,6 @@ fn parse_channel_midi(data: &[u8], midi_channel: u8) -> Result<Vec<TimedMidiEven
             }
             _ => {
                 // Unknown - skip
-                pos += 1;
             }
         }
     }

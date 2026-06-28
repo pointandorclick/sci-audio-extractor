@@ -5,7 +5,7 @@ use moont::cm32l;
 use moont::Synth;
 
 use crate::error::SciError;
-use crate::sound::TimedMidiEvent;
+use crate::sound::{TimedMidiEvent, Track};
 
 /// Sample rate of the CM-32L emulator output.
 pub const SAMPLE_RATE: u32 = 32000;
@@ -67,6 +67,7 @@ pub fn render_to_pcm_with_rom_data(
     control_rom: &[u8],
     pcm_rom: &[u8],
     events: &[TimedMidiEvent],
+    track: &Track,
 ) -> Result<Vec<i16>, SciError> {
     let rom = cm32l::Rom::new(control_rom, pcm_rom)
         .map_err(|e| SciError::RomError(format!("Invalid ROM data: {e:?}")))?;
@@ -75,6 +76,10 @@ pub fn render_to_pcm_with_rom_data(
     if events.is_empty() {
         return Ok(Vec::new());
     }
+
+    // Send init commands matching ScummVM's sendInitCommands().
+    // This sets up voice counts per channel and resets controller state.
+    send_init_commands(&mut device, track);
 
     // Calculate total duration in samples
     let last_tick = events.last().map(|e| e.tick).unwrap_or(0);
@@ -146,10 +151,8 @@ fn send_midi_event(device: &mut cm32l::Device, event: &TimedMidiEvent) {
     }
 
     if msg[0] == 0xF0 {
-        // SysEx message - send via play_msg with special encoding
-        // moont expects sysex via the sysex interface if available,
-        // or as packed u32 messages for short messages.
-        // For now, skip sysex (most SCI1+ games don't rely on it for basic playback)
+        // SysEx message - essential for MT-32 custom instrument patches
+        device.play_sysex(msg);
         return;
     }
 
@@ -162,4 +165,36 @@ fn send_midi_event(device: &mut cm32l::Device, event: &TimedMidiEvent) {
     };
 
     device.play_msg(packed);
+}
+
+/// Send initialization commands to the CM-32L before playback.
+/// Mirrors ScummVM's MidiParser_SCI::sendInitCommands().
+fn send_init_commands(device: &mut cm32l::Device, track: &Track) {
+    for channel in &track.channels {
+        if channel.midi_channel == 0xFE || channel.midi_channel == 0x0F {
+            continue; // Skip digital and control channels
+        }
+
+        let ch = channel.midi_channel as u32;
+
+        // CC 0x4B (75) = voice count (polyphony) for this channel
+        let voices_msg: u32 = (0xB0 | ch) | (0x4B << 8) | ((channel.polyphony as u32) << 16);
+        device.play_msg(voices_msg);
+
+        // CC 0x07 = volume reset to 127
+        let vol_msg: u32 = (0xB0 | ch) | (0x07 << 8) | (127 << 16);
+        device.play_msg(vol_msg);
+
+        // CC 0x0A = pan reset to 64 (center)
+        let pan_msg: u32 = (0xB0 | ch) | (0x0A << 8) | (64 << 16);
+        device.play_msg(pan_msg);
+
+        // CC 0x40 = hold/sustain off
+        let hold_msg: u32 = (0xB0 | ch) | (0x40 << 8);
+        device.play_msg(hold_msg);
+
+        // Pitch wheel reset to center (0x2000 = 8192)
+        let pitch_msg: u32 = (0xE0 | ch) | (0x00 << 8) | (0x40 << 16);
+        device.play_msg(pitch_msg);
+    }
 }
