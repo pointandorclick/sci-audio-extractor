@@ -1,3 +1,5 @@
+pub mod mt32_patch;
+
 use std::fs;
 use std::path::Path;
 
@@ -6,6 +8,7 @@ use moont::Synth;
 
 use crate::error::SciError;
 use crate::sound::{TimedMidiEvent, Track};
+use crate::synth::mt32_patch::Mt32PatchData;
 
 /// Sample rate of the CM-32L emulator output.
 pub const SAMPLE_RATE: u32 = 32000;
@@ -68,6 +71,7 @@ pub fn render_to_pcm_with_rom_data(
     pcm_rom: &[u8],
     events: &[TimedMidiEvent],
     track: &Track,
+    patch_data: Option<&Mt32PatchData>,
 ) -> Result<Vec<i16>, SciError> {
     let rom = cm32l::Rom::new(control_rom, pcm_rom)
         .map_err(|e| SciError::RomError(format!("Invalid ROM data: {e:?}")))?;
@@ -76,6 +80,10 @@ pub fn render_to_pcm_with_rom_data(
     if events.is_empty() {
         return Ok(Vec::new());
     }
+
+    // Send MT-32 factory reset and load game-specific patches.
+    // This mirrors ScummVM's resetMt32() + readMt32Patch() sequence.
+    load_mt32_patches(&mut device, patch_data);
 
     // Send init commands matching ScummVM's sendInitCommands().
     // This sets up voice counts per channel and resets controller state.
@@ -142,7 +150,12 @@ pub fn render_to_pcm_with_rom_data(
     Ok(pcm)
 }
 
-/// Send a MIDI event to the CM-32L device.
+/// Send a MIDI event to the CM-32L device, applying ScummVM's message filtering.
+///
+/// Mirrors ScummVM's MidiPlayer_Midi::send() behavior:
+/// - Drops aftertouch (0xA0) and channel pressure (0xD0) messages
+/// - Intercepts CC 0x4B (voice count, Sierra-internal) and CC 0x4E (velocity)
+/// - Converts note-on with velocity 0 to note-off
 fn send_midi_event(device: &mut cm32l::Device, event: &TimedMidiEvent) {
     let msg = &event.message;
 
@@ -156,15 +169,80 @@ fn send_midi_event(device: &mut cm32l::Device, event: &TimedMidiEvent) {
         return;
     }
 
+    let status = msg[0] & 0xF0;
+
+    // Drop aftertouch and channel pressure - MT-32 driver ignores these
+    if status == 0xA0 || status == 0xD0 {
+        return;
+    }
+
+    // Filter control changes that ScummVM intercepts
+    if status == 0xB0 && msg.len() >= 2 {
+        let cc = msg[1];
+        match cc {
+            0x4B => return, // Voice count - Sierra-internal, not sent to hardware
+            0x4E => return, // Velocity mapping - intercepted by ScummVM
+            _ => {}
+        }
+    }
+
+    // Convert note-on with velocity 0 to note-off (standard MIDI convention)
+    let final_msg: Vec<u8> = if status == 0x90 && msg.len() >= 3 && msg[2] == 0 {
+        let channel = msg[0] & 0x0F;
+        vec![0x80 | channel, msg[1], 0]
+    } else {
+        msg.to_vec()
+    };
+
     // Pack short MIDI message into u32 for play_msg
-    let packed: u32 = match msg.len() {
-        1 => msg[0] as u32,
-        2 => (msg[0] as u32) | ((msg[1] as u32) << 8),
-        3 => (msg[0] as u32) | ((msg[1] as u32) << 8) | ((msg[2] as u32) << 16),
+    let packed: u32 = match final_msg.len() {
+        1 => final_msg[0] as u32,
+        2 => (final_msg[0] as u32) | ((final_msg[1] as u32) << 8),
+        3 => (final_msg[0] as u32) | ((final_msg[1] as u32) << 8) | ((final_msg[2] as u32) << 16),
         _ => return,
     };
 
     device.play_msg(packed);
+}
+
+/// Load MT-32 factory reset and game-specific patch data onto the device.
+/// Mirrors ScummVM's resetMt32() + readMt32Patch() sequence.
+fn load_mt32_patches(device: &mut cm32l::Device, patch_data: Option<&Mt32PatchData>) {
+    // Render block for settling - give the emulator processing time after SysEx
+    const SETTLE_BLOCK: usize = 256;
+    let mut settle_buf = vec![moont::Frame::default(); SETTLE_BLOCK];
+
+    // Send factory reset (address 0x7F0000, data [0x01, 0x00])
+    let reset_msg = mt32_patch::build_reset_sysex();
+    device.play_sysex(&reset_msg);
+
+    // Render ~200ms of silence for the reset to take effect (emulator needs cycles)
+    // 32000 Hz * 0.2s = 6400 samples
+    let reset_settle_frames = (SAMPLE_RATE as usize * 200) / 1000;
+    let mut remaining = reset_settle_frames;
+    while remaining > 0 {
+        let n = remaining.min(SETTLE_BLOCK);
+        device.render(&mut settle_buf[..n]);
+        remaining -= n;
+    }
+
+    // Load game-specific patches if available
+    if let Some(data) = patch_data {
+        let messages = mt32_patch::build_patch_sysex_messages(data);
+        for msg in &messages {
+            device.play_sysex(msg);
+
+            // Give the emulator some cycles to process each SysEx
+            // ~20ms per message (32000 * 0.02 = 640 frames)
+            let settle_frames = (SAMPLE_RATE as usize * 20) / 1000;
+            let mut rem = settle_frames;
+            while rem > 0 {
+                let n = rem.min(SETTLE_BLOCK);
+                device.render(&mut settle_buf[..n]);
+                rem -= n;
+            }
+        }
+    }
 }
 
 /// Send initialization commands to the CM-32L before playback.

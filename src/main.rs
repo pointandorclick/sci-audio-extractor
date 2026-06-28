@@ -9,6 +9,7 @@ use sci_audio_extractor::resource::map::ResourceMap;
 use sci_audio_extractor::resource::volume;
 use sci_audio_extractor::sound::parser;
 use sci_audio_extractor::synth;
+use sci_audio_extractor::synth::mt32_patch::{self, Mt32PatchData};
 
 #[derive(Parser, Debug)]
 #[command(name = "sci-audio-extractor")]
@@ -127,6 +128,43 @@ fn main() -> Result<()> {
         eprintln!("CM-32L ROMs loaded from {}", args.rom_dir.display());
     }
 
+    // Load MT-32 patch resource (#1) for custom instrument definitions
+    let mt32_patch_data: Option<Mt32PatchData> = match resource_map.patch_entry(1) {
+        Some(patch_entry) => {
+            match volume::read_resource(game_dir, patch_entry, resource_map.version) {
+                Ok(data) => match mt32_patch::parse_mt32_patch(&data) {
+                    Ok(patch_data) => {
+                        if args.verbose {
+                            eprintln!(
+                                "Loaded MT-32 patch: {} timbres, volume={}, extended={}",
+                                patch_data.timbres.len(),
+                                patch_data.volume,
+                                patch_data.patches_49_96.is_some(),
+                            );
+                        }
+                        Some(patch_data)
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: Failed to parse MT-32 patch resource: {e}");
+                        None
+                    }
+                },
+                Err(e) => {
+                    if args.verbose {
+                        eprintln!("No MT-32 patch resource found: {e}");
+                    }
+                    None
+                }
+            }
+        }
+        None => {
+            if args.verbose {
+                eprintln!("No MT-32 patch resource (#1) in resource map");
+            }
+            None
+        }
+    };
+
     // Create output directory
     fs::create_dir_all(&args.output_dir)?;
 
@@ -158,6 +196,7 @@ fn main() -> Result<()> {
             &resource_map,
             &control_rom,
             &pcm_rom,
+            mt32_patch_data.as_ref(),
             &args.output_dir,
             &args.format,
             args.quality,
@@ -183,6 +222,7 @@ fn process_sound(
     resource_map: &ResourceMap,
     control_rom: &[u8],
     pcm_rom: &[u8],
+    patch_data: Option<&Mt32PatchData>,
     output_dir: &Path,
     format: &str,
     quality: f32,
@@ -262,7 +302,7 @@ fn process_sound(
     }
 
     // Render through CM-32L
-    let pcm = synth::render_to_pcm_with_rom_data(control_rom, pcm_rom, &events, mt32_track)
+    let pcm = synth::render_to_pcm_with_rom_data(control_rom, pcm_rom, &events, mt32_track, patch_data)
         .with_context(|| format!("Failed to render sound {}", entry.number))?;
 
     if pcm.is_empty() {

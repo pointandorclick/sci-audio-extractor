@@ -49,6 +49,13 @@ impl ResourceMap {
             .filter(|e| e.resource_type == 0x84)
             .collect()
     }
+
+    /// Get a specific patch resource entry by number.
+    pub fn patch_entry(&self, number: u16) -> Option<&ResourceEntry> {
+        self.entries
+            .iter()
+            .find(|e| e.resource_type == 0x89 && e.number == number)
+    }
 }
 
 /// A type directory entry: maps a resource type byte to its lookup table offset.
