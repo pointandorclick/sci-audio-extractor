@@ -4,6 +4,8 @@ A command-line tool that extracts sound resources from Sierra SCI games and rend
 
 Sierra's SCI1/SCI1.1 games stored music as MIDI data targeting the Roland MT-32/CM-32L sound module. This tool parses the game's resource files, extracts the MIDI sound data, synthesizes it through an emulated CM-32L, and encodes the output as OGG Vorbis or WAV.
 
+This tool was created to aid in the creation of [Sierra Quest](https://pointandclick.studio/games/sierra-quest) a fan-mdae point and click Sierra adventure game.
+
 ## Requirements
 
 ### CM-32L ROM Files
